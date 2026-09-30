@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from .config import settings
 from .db import Database
 from .arbiter import Arbiter, ArbiterConflict, ArbiterError
+from .budget import Budget, BudgetConflict, BudgetError
 from .store import (
     AliasConflict,
     CorrectionConflict,
@@ -125,8 +126,64 @@ class FailIn(BaseModel):
     error: str
 
 
+# ------------------------------------------------------------ 预算凭证
+
+class CustomerIn(BaseModel):
+    name: str
+    refill_amount: int = Field(description="每次补充额度")
+    period_seconds: int = Field(description="补充间隔秒数（>0）")
+    burst_cap: int = Field(description="突发上限：available+reserved 天花板")
+    initial: Optional[int] = Field(default=None, description="期初可用额")
+
+
+class CustomerPolicyIn(BaseModel):
+    refill_amount: Optional[int] = None
+    period_seconds: Optional[int] = None
+    burst_cap: Optional[int] = None
+    paused: Optional[bool] = None
+
+
+class BudgetJobIn(BaseModel):
+    customer: str
+    estimated: int = Field(description="工单预计消耗（>0 整数）")
+    business_key: str
+    payload: dict = {}
+
+
+class BudgetClaimIn(BaseModel):
+    holder: str
+    customer: Optional[str] = None
+
+
+class BudgetReportIn(BaseModel):
+    hold_epoch: int
+    holder: str
+    used_total: int
+
+
+class BudgetExtendIn(BaseModel):
+    hold_epoch: int
+    holder: str
+    extra: int
+
+
+class BudgetCompleteIn(BaseModel):
+    hold_epoch: int
+    holder: str
+    final_total: Optional[int] = None
+
+
+class TerminateIn(BaseModel):
+    reason: Optional[str] = None
+
+
+class TakeoverIn(BaseModel):
+    holder: str
+
+
 def create_app(store: Optional[Store] = None,
-               arbiter: Optional[Arbiter] = None) -> FastAPI:
+               arbiter: Optional[Arbiter] = None,
+               budget: Optional[Budget] = None) -> FastAPI:
     app = FastAPI(title="FeatForge", version="1.0",
                   description="机器学习特征物化与回填服务")
     if store is None:
@@ -135,11 +192,18 @@ def create_app(store: Optional[Store] = None,
     if arbiter is None:
         arbiter = Arbiter(store.db, clock=store.now)
     app.state.arbiter = arbiter
+    if budget is None:
+        budget = Budget(store.db, clock=store.now)
+    app.state.budget = budget
 
     def ok(err: Exception) -> HTTPException:
         return HTTPException(status_code=400, detail=str(err))
 
     def arb_conflict(err: ArbiterConflict) -> HTTPException:
+        return HTTPException(status_code=409, detail={
+            "error": err.code, "message": str(err)})
+
+    def bg_conflict(err: BudgetConflict) -> HTTPException:
         return HTTPException(status_code=409, detail={
             "error": err.code, "message": str(err)})
 
@@ -514,12 +578,188 @@ def create_app(store: Optional[Store] = None,
     def audits(limit: int = 100):
         return store.list_audits(limit)
 
+    # ----------------------------------------------- 容量凭证与预算结算
+
+    @app.get("/api/v1/budget/customers")
+    def bg_list_customers():
+        return budget.list_customers()
+
+    @app.post("/api/v1/budget/customers", status_code=201)
+    def bg_create_customer(body: CustomerIn):
+        try:
+            return budget.create_customer(
+                body.name, body.refill_amount, body.period_seconds,
+                body.burst_cap, body.initial)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.get("/api/v1/budget/customers/{name}")
+    def bg_get_customer(name: str):
+        try:
+            return budget.get_customer(name)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.put("/api/v1/budget/customers/{name}/policy")
+    def bg_update_policy(name: str, body: CustomerPolicyIn):
+        try:
+            return budget.update_policy(
+                name, refill_amount=body.refill_amount,
+                period_seconds=body.period_seconds,
+                burst_cap=body.burst_cap, paused=body.paused)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.post("/api/v1/budget/customers/{name}/pause")
+    def bg_pause(name: str):
+        try:
+            return budget.pause(name)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.post("/api/v1/budget/customers/{name}/resume")
+    def bg_resume(name: str):
+        try:
+            return budget.resume(name)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.post("/api/v1/budget/jobs", status_code=201)
+    def bg_submit_job(body: BudgetJobIn):
+        try:
+            result = budget.submit_job(
+                body.customer, body.estimated, body.business_key, body.payload)
+            # 重放返回 200，新预留/延后返回 201
+            if result["replayed"]:
+                return Response(
+                    content=json.dumps(result, ensure_ascii=False),
+                    status_code=200, media_type="application/json")
+            return result
+        except BudgetConflict as e:
+            raise bg_conflict(e)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.get("/api/v1/budget/jobs")
+    def bg_list_jobs(customer: Optional[str] = None,
+                     state: Optional[str] = None, limit: int = 200):
+        try:
+            return budget.list_jobs(customer, state, limit)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.get("/api/v1/budget/jobs/{job_id}")
+    def bg_get_job(job_id: int):
+        try:
+            return budget.get_job(job_id)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.get("/api/v1/budget/jobs/{job_id}/vouchers")
+    def bg_list_vouchers(job_id: int):
+        try:
+            return budget.list_vouchers(job_id)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.post("/api/v1/budget/claims")
+    def bg_claim(body: BudgetClaimIn):
+        try:
+            return (budget.claim_next(body.holder, customer_ref=body.customer)
+                    or {"idle": True})
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.post("/api/v1/budget/jobs/{job_id}/takeover")
+    def bg_takeover(job_id: int, body: TakeoverIn):
+        try:
+            return budget.takeover(job_id, body.holder)
+        except BudgetConflict as e:
+            raise bg_conflict(e)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.post("/api/v1/budget/jobs/{job_id}/heartbeat")
+    def bg_heartbeat(job_id: int, body: BudgetReportIn):
+        try:
+            return budget.heartbeat(job_id, body.hold_epoch, body.holder)
+        except BudgetConflict as e:
+            raise bg_conflict(e)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.post("/api/v1/budget/jobs/{job_id}/report")
+    def bg_report(job_id: int, body: BudgetReportIn):
+        try:
+            return budget.report(job_id, body.hold_epoch, body.holder,
+                                 body.used_total)
+        except BudgetConflict as e:
+            raise bg_conflict(e)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.post("/api/v1/budget/jobs/{job_id}/extend")
+    def bg_extend(job_id: int, body: BudgetExtendIn):
+        try:
+            return budget.extend_reservation(
+                job_id, body.hold_epoch, body.holder, body.extra)
+        except BudgetConflict as e:
+            raise bg_conflict(e)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.post("/api/v1/budget/jobs/{job_id}/complete")
+    def bg_complete(job_id: int, body: BudgetCompleteIn):
+        try:
+            return budget.complete(job_id, body.hold_epoch, body.holder,
+                                   body.final_total)
+        except BudgetConflict as e:
+            raise bg_conflict(e)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.post("/api/v1/budget/jobs/{job_id}/terminate")
+    def bg_terminate(job_id: int, body: TerminateIn):
+        try:
+            return budget.terminate(job_id, body.reason)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.post("/api/v1/budget/reap-lost")
+    def bg_reap_lost():
+        return {"lost": budget.reap_lost()}
+
+    @app.post("/api/v1/budget/tick")
+    def bg_tick():
+        return budget.tick()
+
+    @app.get("/api/v1/budget/blocked")
+    def bg_blocked():
+        return budget.blocked_jobs()
+
+    @app.get("/api/v1/budget/ledger")
+    def bg_ledger(customer: Optional[str] = None, job_id: Optional[int] = None,
+                  limit: int = 500):
+        try:
+            return budget.ledger(customer, job_id, limit)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.get("/api/v1/budget/verify")
+    def bg_verify():
+        return budget.verify_invariants()
+
+    @app.get("/api/v1/budget/status")
+    def bg_status():
+        return budget.status()
+
     # ------------------------------------------------------- 状态页
 
     @app.get("/", response_class=HTMLResponse)
     def status_page():
         ov = store.overview()
         ov["arbiter"] = arbiter.status()
+        ov["budget"] = budget.status()
         return _render_page(ov)
 
     return app
@@ -533,6 +773,9 @@ def _badge(state: str) -> str:
         "succeeded": "#1a7f37", "failed": "#cf222e", "done": "#1a7f37",
         "pending": "#9a6700",
         "accepted": "#0969da", "applying": "#9a6700", "applied": "#1a7f37",
+        "waiting": "#9a6700", "ready": "#0969da",
+        "running": "#0969da", "paused": "#cf222e",
+        "lost": "#cf222e", "terminated": "#57606a",
     }
     color = colors.get(state, "#57606a")
     return (f'<span style="background:{color}1a;color:{color};padding:2px 8px;'
@@ -674,6 +917,73 @@ code{{background:#eff1f3;padding:1px 5px;border-radius:4px}}
                 f"<td>{_esc(h['tenant_name'] or '-')}</td>"
                 f"<td>{h['job_id'] or '-'}</td><td>{h['claim_epoch'] or '-'}</td>"
                 f"<td class='muted'>{detail}</td></tr>")
+        parts.append("</table>")
+
+    # ----------------------------------------------- 容量凭证与预算结算
+    bg = ov.get("budget") or {}
+    parts.append('<h2>&#128176; 后台计算预算（容量凭证 / 延后区 / 结算）</h2>')
+    parts.append(
+        f'<p class="muted">提交即原子预留预计消耗，余额不足进延后区并标出最早'
+        f"可执行时间；实际消耗超额必须追加预留，否则停在最近已确认位置并释放"
+        f"席位。全局席位 {bg.get('seats_used', '-')}/{bg.get('total_seats', '-')}"
+        f"，心跳 TTL {bg.get('lease_ttl', '-')}s。在线调预算不撤销已发出凭证。</p>")
+    if not bg.get("customers"):
+        parts.append('<p class="muted">暂无客户，POST /api/v1/budget/customers 创建。</p>')
+    else:
+        parts.append(
+            "<table><tr><th>客户</th><th>可用额</th><th>已预留</th>"
+            "<th>已结算</th><th>突发上限</th><th>占用/上限</th>"
+            "<th>补充额/周期</th><th>下次补充时间</th><th>状态</th></tr>")
+        for t in bg["customers"]:
+            paused = (' <span style="color:#cf222e;font-weight:600">已暂停'
+                      "</span>") if t["paused"] else ""
+            parts.append(
+                f"<tr><td><b>{_esc(t['name'])}</b>{paused}</td>"
+                f"<td style='color:#1a7f37;font-weight:600'>{t['available']}</td>"
+                f"<td>{t['reserved']}</td>"
+                f"<td>{t['settled']}</td>"
+                f"<td>{t['burst_cap']}</td>"
+                f"<td>{t['outstanding']}/{t['burst_cap']}</td>"
+                f"<td>{t['refill_amount']}/{t['period_seconds']}s</td>"
+                f"<td>{t['next_refill_at'] or '-'}</td>"
+                f"<td>{'暂停' if t['paused'] else '正常'}</td></tr>")
+        parts.append("</table>")
+        blocked = bg.get("blocked") or []
+        parts.append(
+            "<h3 style='font-size:14px'>被预算阻塞的工单（延后区 / 超额暂停）</h3>")
+        if not blocked:
+            parts.append('<p class="muted">无。</p>')
+        else:
+            parts.append(
+                "<table><tr><th>#</th><th>客户</th><th>业务键</th><th>状态</th>"
+                "<th>预估</th><th>凭证</th><th>已确认位置</th><th>阻塞原因</th>"
+                "<th>最早可执行时间</th></tr>")
+            for j in blocked:
+                parts.append(
+                    f"<tr><td>{j['id']}</td><td>{_esc(j['customer'])}</td>"
+                    f"<td><code>{_esc(j['business_key'])}</code></td>"
+                    f"<td>{_badge(j['state'])}</td>"
+                    f"<td>{j['estimated']}</td><td>{j['held_total']}</td>"
+                    f"<td>{j['used_total']}</td>"
+                    f"<td class='muted'>{_esc(j['blocked_reason'] or '')}</td>"
+                    f"<td>{j['earliest_ready_at'] or '永远等不到（停止补充/超上限）'}"
+                    "</td></tr>")
+            parts.append("</table>")
+        parts.append(
+            "<h3 style='font-size:14px'>预算工单</h3><table><tr><th>#</th>"
+            "<th>客户</th><th>业务键</th><th>状态</th><th>预估/凭证</th>"
+            "<th>已结算</th><th>已退款</th><th>epoch</th><th>持有者</th>"
+            "<th>最近心跳</th></tr>")
+        for j in bg.get("jobs", [])[:50]:
+            parts.append(
+                f"<tr><td>{j['id']}</td><td>{_esc(j['customer'])}</td>"
+                f"<td><code>{_esc(j['business_key'])}</code></td>"
+                f"<td>{_badge(j['state'])}</td>"
+                f"<td>{j['estimated']}/{j['held_total']}</td>"
+                f"<td>{j['used_total']}</td><td>{j['refunded_total']}</td>"
+                f"<td>{j['hold_epoch']}</td>"
+                f"<td>{_esc(j['holder'] or '-')}</td>"
+                f"<td>{j['last_heartbeat_at'] or '-'}</td></tr>")
         parts.append("</table>")
 
     parts.append("<h2>事件订正台账</h2>")

@@ -294,6 +294,95 @@ CREATE TABLE IF NOT EXISTS arb_history (
     reason TEXT,
     detail TEXT NOT NULL DEFAULT '{}'
 );
+
+-- ============================================================
+-- 后台计算：容量凭证与预算结算
+-- ============================================================
+
+-- 客户预算策略：令牌桶 outstanding = available + reserved。
+-- 每过 period_seconds 补充 refill_amount，补充后 outstanding 不超过
+-- burst_cap；在线改策略只影响后续补充与后续预留，绝不改动已发出的凭证。
+CREATE TABLE IF NOT EXISTS bg_customers (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    refill_amount INTEGER NOT NULL,     -- 每次补充额度（整数，避免浮点竞争）
+    period_seconds INTEGER NOT NULL,    -- 补充间隔（>0）；refill=0 表示停止补充
+    burst_cap INTEGER NOT NULL,         -- 突发上限：available+reserved 的天花板
+    available INTEGER NOT NULL,         -- 当前可用额（尚未预留）
+    reserved_total INTEGER NOT NULL DEFAULT 0,  -- 全部未完成凭证的预留合计
+    last_refill_at INTEGER NOT NULL,    -- 上次补充到账时刻
+    paused INTEGER NOT NULL DEFAULT 0,  -- 暂停：阻止自动唤醒派发，不撤销凭证
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+-- 预算工单。
+-- state: waiting（延后区，余额不足）| ready（已取得资格，排队等席位）|
+--        running（持有执行席位）| paused（超额且追加预留失败，已让出席位）|
+--        succeeded | terminated | lost（失联，等待接管；无席位）
+-- hold_epoch 即凭证 fencing 纪元：每次取得席位（含失联接管、暂停后恢复）
+-- 单调 +1，旧持有者的迟到上报/心跳/完成一律 409 stale_epoch。
+-- used_total 单调递增：最近一次已确认消耗，失联接替者沿用该值继续结算。
+CREATE TABLE IF NOT EXISTS bg_jobs (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER NOT NULL REFERENCES bg_customers(id),
+    business_key TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    estimated INTEGER NOT NULL,         -- 提交时声明的预计消耗
+    held_total INTEGER NOT NULL,        -- 已发出凭证总额（初始预留 + 追加预留）
+    used_total INTEGER NOT NULL DEFAULT 0,  -- 已结算（已确认）实际消耗
+    pending_total INTEGER NOT NULL DEFAULT 0, -- 暂停时尝试到达但未追加成功的位置
+    settled_total INTEGER NOT NULL DEFAULT 0, -- 已结算额（=used，冗余便于读）
+    refunded_total INTEGER NOT NULL DEFAULT 0, -- 终止/完成退还的未用部分
+    state TEXT NOT NULL,
+    hold_epoch INTEGER NOT NULL DEFAULT 0,
+    holder TEXT,
+    enq_seq INTEGER NOT NULL,           -- 延后/就绪队列的 FIFO 序号
+    blocked_reason TEXT,
+    earliest_ready_at INTEGER,          -- 延后区工单的最早可执行时间
+    last_heartbeat_at INTEGER,
+    finished_at INTEGER,
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    UNIQUE(customer_id, business_key)
+);
+CREATE INDEX IF NOT EXISTS idx_bg_jobs_state_cust
+    ON bg_jobs(state, customer_id);
+CREATE INDEX IF NOT EXISTS idx_bg_jobs_queue
+    ON bg_jobs(customer_id, enq_seq);
+
+-- 容量凭证：每次预留追加一行（REV-初始、EXT-追加），永不修改；
+-- 在线调整预算不撤销已发出凭证。终止/完成只退尚未使用的部分。
+CREATE TABLE IF NOT EXISTS bg_vouchers (
+    id INTEGER PRIMARY KEY,
+    job_id INTEGER NOT NULL REFERENCES bg_jobs(id),
+    seq INTEGER NOT NULL,               -- 同一工单内凭证序号（1 起）
+    kind TEXT NOT NULL,                -- reserve（初始预留）| extend（追加预留）
+    amount INTEGER NOT NULL,           -- 该张凭证面额
+    cumulative INTEGER NOT NULL,       -- 开出后凭证总额 held_total
+    claim_epoch INTEGER NOT NULL,      -- 开出时的凭证纪元（初始=0，接管不变）
+    at INTEGER NOT NULL,
+    UNIQUE(job_id, seq)
+);
+
+-- 不可变复式台账：每行同时记 available/reserved/settled 三栏的有符号增量，
+-- 任意一行三栏增量之和为 0，因此全表 SUM 恒为 0（对账依据）。
+-- op: reserve / release_refused / extend / settle / refund / refill
+CREATE TABLE IF NOT EXISTS bg_ledger (
+    id INTEGER PRIMARY KEY,
+    at INTEGER NOT NULL,
+    customer_id INTEGER NOT NULL REFERENCES bg_customers(id),
+    job_id INTEGER,                    -- refill 行为 NULL
+    op TEXT NOT NULL,
+    claim_epoch INTEGER,
+    d_available INTEGER NOT NULL,
+    d_reserved INTEGER NOT NULL,
+    d_settled INTEGER NOT NULL,
+    note TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_bg_ledger_customer
+    ON bg_ledger(customer_id, id);
+CREATE INDEX IF NOT EXISTS idx_bg_ledger_job ON bg_ledger(job_id, id);
 """
 
 

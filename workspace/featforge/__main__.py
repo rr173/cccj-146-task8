@@ -13,6 +13,8 @@ import threading
 import uvicorn
 
 from .api import create_app
+from .budget import Budget
+from .budget_ticker import BudgetTicker
 from .config import settings
 from .db import Database
 from .store import Store
@@ -31,6 +33,10 @@ def main() -> None:
     args = parser.parse_args()
 
     store = Store(Database(settings.db_path))
+    budget = Budget(store.db, clock=store.now)
+    # 预算记账维护（补充/唤醒/失联回收）与业务执行解耦，API/worker 都可启动；
+    # tick 全走 IMMEDIATE 事务，多副本重复触发安全。
+    ticker = BudgetTicker(budget, interval_seconds=1.0).start()
 
     if args.role in ("worker", "all"):
         worker = Worker(store, auto_promote=not args.no_auto_promote)
@@ -38,7 +44,7 @@ def main() -> None:
         t.start()
 
     if args.role in ("api", "all"):
-        app = create_app(store)
+        app = create_app(store, budget=budget)
         uvicorn.run(app, host=args.host, port=args.port)
     else:
         t.join()

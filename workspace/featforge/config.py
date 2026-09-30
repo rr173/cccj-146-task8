@@ -49,5 +49,14 @@ class Settings:
     arbiter_snapshot_dir: str = os.environ.get(
         "FEATFORGE_ARBITER_SNAPSHOT_DIR", "/tmp/featforge-snapshots")
 
+    # ---- 后台计算：容量凭证与预算结算 ----
+    # 心跳 TTL：running 工单超过该时间无心跳即判失联、释放席位、可被接管
+    budget_lease_ttl: int = _env_int("FEATFORGE_BUDGET_LEASE_TTL", 30)
+    # 全局执行席位数（跨所有客户；凭证管“钱”，席位管“坑位”，暂停超额
+    # 时必须立即让出坑位，不能继续占着）
+    budget_seats: int = _env_int("FEATFORGE_BUDGET_SEATS", 4)
+    # 台账查询/状态页默认返回上限
+    budget_ledger_limit: int = _env_int("FEATFORGE_BUDGET_LEDGER_LIMIT", 1000)
+
 
 settings = Settings()
