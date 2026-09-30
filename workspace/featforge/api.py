@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field
 from .config import settings
 from .db import Database
 from .arbiter import Arbiter, ArbiterConflict, ArbiterError
+from .budget import BudgetConflict, BudgetError, BudgetService
 from .store import (
     AliasConflict,
     CorrectionConflict,
@@ -125,8 +126,55 @@ class FailIn(BaseModel):
     error: str
 
 
+# ------------------------------------------------------------ 容量凭证/预算
+
+class BudgetCustomerIn(BaseModel):
+    name: str
+    refill_amount: int = Field(description="每期补充额度")
+    refill_interval: int = Field(description="补充周期秒数；0=不自动补充")
+    burst_cap: int = Field(description="余额突发上限")
+    max_seats: int = 1
+    opening_balance: Optional[int] = Field(
+        default=None, description="期初余额，缺省=burst_cap")
+
+
+class BudgetPolicyIn(BaseModel):
+    refill_amount: Optional[int] = None
+    refill_interval: Optional[int] = None
+    burst_cap: Optional[int] = None
+    max_seats: Optional[int] = None
+
+
+class VoucherSubmitIn(BaseModel):
+    job_key: str
+    estimate: int = Field(description="工单提交时声明的预计消耗（>0 整数）")
+    submitter: str = "submitter"
+
+
+class VoucherAcquireIn(BaseModel):
+    worker: str
+
+
+class VoucherConsumeIn(BaseModel):
+    claim_epoch: int
+    worker: str
+    consumed_total: int = Field(description="累计实际消耗，只能单调前进")
+
+
+class VoucherCompleteIn(BaseModel):
+    claim_epoch: int
+    worker: str
+    consumed_total: Optional[int] = Field(
+        default=None, description="最终累计消耗；缺省取最近已结算位置")
+
+
+class VoucherTerminateIn(BaseModel):
+    reason: str = "manual"
+
+
 def create_app(store: Optional[Store] = None,
-               arbiter: Optional[Arbiter] = None) -> FastAPI:
+               arbiter: Optional[Arbiter] = None,
+               budget: Optional[BudgetService] = None) -> FastAPI:
     app = FastAPI(title="FeatForge", version="1.0",
                   description="机器学习特征物化与回填服务")
     if store is None:
@@ -135,6 +183,13 @@ def create_app(store: Optional[Store] = None,
     if arbiter is None:
         arbiter = Arbiter(store.db, clock=store.now)
     app.state.arbiter = arbiter
+    if budget is None:
+        budget = BudgetService(store.db, clock=store.now)
+    app.state.budget = budget
+
+    def budget_conflict(err: BudgetConflict) -> HTTPException:
+        return HTTPException(status_code=409, detail={
+            "error": err.code, "message": str(err)})
 
     def ok(err: Exception) -> HTTPException:
         return HTTPException(status_code=400, detail=str(err))
@@ -510,6 +565,121 @@ def create_app(store: Optional[Store] = None,
     def arb_status():
         return arbiter.status()
 
+    # ------------------------------------------- 容量凭证与预算结算
+
+    @app.post("/api/v1/budget/customers", status_code=201)
+    def budget_customer_create(body: BudgetCustomerIn):
+        try:
+            return budget.configure_customer(
+                body.name, body.refill_amount, body.refill_interval,
+                body.burst_cap, max_seats=body.max_seats,
+                opening_balance=body.opening_balance)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.get("/api/v1/budget/customers")
+    def budget_customers():
+        return budget.list_customers()
+
+    @app.get("/api/v1/budget/customers/{name}")
+    def budget_customer_get(name: str):
+        try:
+            return budget.get_customer(name)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.put("/api/v1/budget/customers/{name}/policy")
+    def budget_customer_policy(name: str, body: BudgetPolicyIn):
+        try:
+            return budget.adjust_policy(
+                name, refill_amount=body.refill_amount,
+                refill_interval=body.refill_interval, burst_cap=body.burst_cap,
+                max_seats=body.max_seats)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.post("/api/v1/budget/customers/{name}/vouchers", status_code=201)
+    def voucher_submit(name: str, body: VoucherSubmitIn, response: Response):
+        try:
+            result = budget.submit(name, body.job_key, body.estimate,
+                                   submitter=body.submitter)
+        except BudgetConflict as e:
+            raise budget_conflict(e)
+        except BudgetError as e:
+            raise ok(e)
+        # 余额足够立即取得资格 → 201；进入延后区 → 202（已受理但待额度）
+        response.status_code = 202 if result["state"] == "deferred" else 201
+        return result
+
+    @app.get("/api/v1/budget/vouchers/{voucher_id}")
+    def voucher_get(voucher_id: int):
+        try:
+            return budget.get_voucher(voucher_id)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.get("/api/v1/budget/customers/{name}/vouchers")
+    def voucher_list(name: str, state: Optional[str] = None):
+        try:
+            return budget.list_vouchers(name, state=state)
+        except BudgetError as e:
+            raise ok(e)
+
+    def _voucher_action(name: str, voucher_id: int, action: str, body):
+        try:
+            fn = getattr(budget, action)
+            if action == "heartbeat":
+                return fn(name, voucher_id, body.claim_epoch, body.worker)
+            if action == "acquire":
+                return fn(name, voucher_id, body.worker)
+            if action == "terminate":
+                return fn(name, voucher_id, reason=body.reason)
+            if action == "complete":
+                return fn(name, voucher_id, body.claim_epoch, body.worker,
+                          consumed_total=body.consumed_total)
+            return fn(name, voucher_id, body.claim_epoch, body.worker,
+                      body.consumed_total)
+        except BudgetConflict as e:
+            raise budget_conflict(e)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.post("/api/v1/budget/customers/{name}/vouchers/{voucher_id}/acquire")
+    def voucher_acquire(name: str, voucher_id: int, body: VoucherAcquireIn):
+        return _voucher_action(name, voucher_id, "acquire", body)
+
+    @app.post("/api/v1/budget/customers/{name}/vouchers/{voucher_id}/heartbeat")
+    def voucher_heartbeat(name: str, voucher_id: int, body: VoucherConsumeIn):
+        return _voucher_action(name, voucher_id, "heartbeat", body)
+
+    @app.post("/api/v1/budget/customers/{name}/vouchers/{voucher_id}/consumed")
+    def voucher_consume(name: str, voucher_id: int, body: VoucherConsumeIn):
+        return _voucher_action(name, voucher_id, "report_consumed", body)
+
+    @app.post("/api/v1/budget/customers/{name}/vouchers/{voucher_id}/complete")
+    def voucher_complete(name: str, voucher_id: int, body: VoucherCompleteIn):
+        return _voucher_action(name, voucher_id, "complete", body)
+
+    @app.post("/api/v1/budget/customers/{name}/vouchers/{voucher_id}/terminate")
+    def voucher_terminate(name: str, voucher_id: int, body: VoucherTerminateIn):
+        return _voucher_action(name, voucher_id, "terminate", body)
+
+    @app.get("/api/v1/budget/ledger")
+    def budget_ledger(customer: Optional[str] = None,
+                      voucher_id: Optional[int] = None, limit: int = 200):
+        try:
+            return budget.ledger(customer, voucher_id=voucher_id, limit=limit)
+        except BudgetError as e:
+            raise ok(e)
+
+    @app.post("/api/v1/budget/tick")
+    def budget_tick():
+        return budget.tick()
+
+    @app.get("/api/v1/budget/status")
+    def budget_status():
+        return budget.status()
+
     @app.get("/api/v1/audits")
     def audits(limit: int = 100):
         return store.list_audits(limit)
@@ -520,6 +690,7 @@ def create_app(store: Optional[Store] = None,
     def status_page():
         ov = store.overview()
         ov["arbiter"] = arbiter.status()
+        ov["budget"] = budget.status()
         return _render_page(ov)
 
     return app
@@ -532,6 +703,9 @@ def _badge(state: str) -> str:
         "queued": "#0969da", "running": "#9a6700",
         "succeeded": "#1a7f37", "failed": "#cf222e", "done": "#1a7f37",
         "pending": "#9a6700",
+        "reserved": "#0969da", "deferred": "#9a6700",
+        "executing": "#8250df", "paused": "#bf3989",
+        "completed": "#1a7f37", "terminated": "#57606a",
         "accepted": "#0969da", "applying": "#9a6700", "applied": "#1a7f37",
     }
     color = colors.get(state, "#57606a")
@@ -674,6 +848,58 @@ code{{background:#eff1f3;padding:1px 5px;border-radius:4px}}
                 f"<td>{_esc(h['tenant_name'] or '-')}</td>"
                 f"<td>{h['job_id'] or '-'}</td><td>{h['claim_epoch'] or '-'}</td>"
                 f"<td class='muted'>{detail}</td></tr>")
+        parts.append("</table>")
+
+    # ----------------------------------------------- 容量凭证与预算结算
+    bud = ov.get("budget") or {}
+    parts.append('<h2>&#128176; 容量凭证与预算结算</h2>')
+    parts.append(
+        '<p class="muted">工单提交即按预估原子预留；余额不足进延后区并标出'
+        "最早可执行时刻，补充到账自动取得资格。执行按单调进度结算，超额追加"
+        "不上则暂停并释放席位；失联接替沿用已结算金额，旧 epoch 上报 fence "
+        "拒绝；终态唯一，终止只退未用预留。</p>")
+    if not bud.get("customers"):
+        parts.append('<p class="muted">暂无预算客户，'
+                     'POST /api/v1/budget/customers 配置。</p>')
+    else:
+        parts.append(
+            "<table><tr><th>客户</th><th>补充策略</th><th>突发上限</th>"
+            "<th>可用额</th><th>已预留未结算</th><th>已结算</th>"
+            "<th>席位</th><th>下次补充</th><th>被预算阻塞的工单</th></tr>")
+        for t in bud["customers"]:
+            policy = (f"+{t['refill_amount']}/{t['refill_interval']}s"
+                      if t["refill_interval"] else "不自动补充")
+            blocked = "; ".join(
+                f"#{b['id']}({b['state']},待 {b['earliest_ready_at'] or '∞'},"
+                f"需 {b['estimate'] - (b['reserved_total'] if b['state'] == 'paused' else 0)})"
+                for b in t["blocked"]) or "-"
+            parts.append(
+                f"<tr><td><b>{_esc(t['name'])}</b></td><td>{policy}</td>"
+                f"<td>{t['burst_cap']}</td><td><b>{t['available']}</b></td>"
+                f"<td>{t['reserved_open']}</td><td>{t['settled_total']}</td>"
+                f"<td>{t['seats_used']}/{t['max_seats']}</td>"
+                f"<td>{t['next_refill_at'] or '—'}</td>"
+                f"<td class='muted'>{_esc(blocked)}</td></tr>")
+        parts.append("</table>")
+        parts.append(
+            "<h3 style='font-size:14px'>容量凭证明细</h3><table>"
+            "<tr><th>#</th><th>客户</th><th>job_key</th><th>提交者</th>"
+            "<th>预估</th><th>已预留</th><th>已结算</th><th>已退/裁剪</th>"
+            "<th>状态</th><th>epoch</th><th>持有者</th><th>最早可执行</th>"
+            "<th>阻塞原因</th></tr>")
+        vouchers = bud.get("vouchers") or []
+        for v in vouchers:
+            parts.append(
+                f"<tr><td>{v['id']}</td><td>{_esc(v['customer_name'])}</td>"
+                f"<td><code>{_esc(v['job_key'])}</code></td>"
+                f"<td>{_esc(v['submitter'])}</td>"
+                f"<td>{v['estimate']}</td><td>{v['reserved_total']}</td>"
+                f"<td>{v['settled_total']}</td>"
+                f"<td>{v['refunded_total']}/{v['lost_total']}</td>"
+                f"<td>{_badge(v['state'])}</td><td>{v['claim_epoch']}</td>"
+                f"<td>{_esc(v['claim_worker'] or '-')}</td>"
+                f"<td>{v['earliest_ready_at'] or '-'}</td>"
+                f"<td class='muted'>{_esc(v['blocked_reason'] or '')}</td></tr>")
         parts.append("</table>")
 
     parts.append("<h2>事件订正台账</h2>")

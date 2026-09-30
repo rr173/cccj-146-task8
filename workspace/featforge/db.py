@@ -294,6 +294,83 @@ CREATE TABLE IF NOT EXISTS arb_history (
     reason TEXT,
     detail TEXT NOT NULL DEFAULT '{}'
 );
+
+-- ============================================================
+-- 容量凭证与预算结算（capacity credits & settlement）
+-- ============================================================
+
+-- 客户预算策略：按时间离散补充的计算额度 + 突发上限 + 执行席位数。
+-- 余额 balance 是当前可用额度；last_refill_at 是补充锚点，每次惰性补充
+-- 后按 interval 整倍推进。在线调整只改本行：已发出的凭证与账本不动，
+-- 只影响后续预留。
+CREATE TABLE IF NOT EXISTS budget_customers (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    refill_amount INTEGER NOT NULL,      -- 每期补充额度
+    refill_interval INTEGER NOT NULL,    -- 补充周期（秒）；0=不自动补充
+    burst_cap INTEGER NOT NULL,          -- 余额突发上限（补充与退款均被裁剪）
+    max_seats INTEGER NOT NULL,          -- 同时执行（占席位）的凭证上限
+    balance INTEGER NOT NULL,            -- 当前可用额度
+    last_refill_at INTEGER NOT NULL,     -- 最近一次补充锚点
+    created_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL
+);
+
+-- 容量凭证：工单提交即原子预留 estimate；余额不足进延后区并标注最早可执行
+-- 时间。执行中 claim_epoch 每次占用/接管 +1，旧持有者的迟到上报一律 fence
+-- 拒绝；settled_total 单调不减。状态机：
+--   deferred → reserved → executing → completed
+--                          ↘ paused ↗（超额且追加预留失败，释放席位）
+--   任意非终态 → terminated；completed/terminated 为终态，退款只发生一次。
+CREATE TABLE IF NOT EXISTS budget_vouchers (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER NOT NULL REFERENCES budget_customers(id),
+    job_key TEXT NOT NULL,              -- 提交幂等键（客户内唯一）
+    submitter TEXT NOT NULL,
+    estimate INTEGER NOT NULL,          -- 提交时声明的预计消耗
+    reserved_total INTEGER NOT NULL DEFAULT 0,  -- 累计预留（含追加）
+    settled_total INTEGER NOT NULL DEFAULT 0,   -- 已结算消耗（单调不减）
+    pending_total INTEGER,              -- paused 时执行者请求但未获预留的位置
+    refunded_total INTEGER NOT NULL DEFAULT 0,  -- 终态退还的未用预留
+    lost_total INTEGER NOT NULL DEFAULT 0,      -- 退款/裁剪时超过突发上限的损耗
+    state TEXT NOT NULL,                -- deferred|reserved|executing|paused|completed|terminated
+    blocked_reason TEXT,                -- deferred: over_burst_cap|insufficient_balance
+    earliest_ready_at INTEGER,          -- 延后区：预计最早可执行时刻
+    claim_epoch INTEGER NOT NULL DEFAULT 0,
+    claim_worker TEXT,
+    claimed_at INTEGER,
+    lease_expires_at INTEGER,
+    last_heartbeat_at INTEGER,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    submitted_at INTEGER NOT NULL,
+    finalized_at INTEGER,
+    outcome TEXT,                       -- completed|terminated（终态归因，仅一次）
+    terminate_reason TEXT,
+    UNIQUE(customer_id, job_key)
+);
+CREATE INDEX IF NOT EXISTS idx_bv_customer_state
+    ON budget_vouchers(customer_id, state);
+
+-- 预算账本：只追加，不修改。每行记录三栏变动：
+--   avail_delta   对客户可用余额的影响（补充/退款为正，预留为负）
+--   reserve_delta 对“已预留未结算”总额的影响（预留为正，结算/退款为负）
+--   settle_delta  对“已结算”总额的影响（只增）
+-- balance_after 记录该行之后的余额；任意时刻
+--   balance == SUM(avail_delta)，预留/结算总额均可由本表重放核对。
+CREATE TABLE IF NOT EXISTS budget_ledger (
+    id INTEGER PRIMARY KEY,
+    at INTEGER NOT NULL,
+    customer_id INTEGER NOT NULL REFERENCES budget_customers(id),
+    voucher_id INTEGER REFERENCES budget_vouchers(id),
+    kind TEXT NOT NULL,        -- refill|reserve|reserve_extra|settle|refund|cap_clamp
+    avail_delta INTEGER NOT NULL DEFAULT 0,
+    reserve_delta INTEGER NOT NULL DEFAULT 0,
+    settle_delta INTEGER NOT NULL DEFAULT 0,
+    balance_after INTEGER NOT NULL,
+    note TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_bl_customer ON budget_ledger(customer_id, id);
+CREATE INDEX IF NOT EXISTS idx_bl_voucher ON budget_ledger(voucher_id, id);
 """
 
 

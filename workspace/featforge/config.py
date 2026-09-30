@@ -49,5 +49,11 @@ class Settings:
     arbiter_snapshot_dir: str = os.environ.get(
         "FEATFORGE_ARBITER_SNAPSHOT_DIR", "/tmp/featforge-snapshots")
 
+    # ---- 容量凭证与预算结算 ----
+    # 凭证执行租约 TTL：占用后该时间内无心跳即可被接替（旧 epoch fence）
+    budget_lease_ttl: int = _env_int("FEATFORGE_BUDGET_LEASE_TTL", 30)
+    # 后台补充/唤醒线程轮询间隔（秒）；金额本身惰性计算，不依赖该线程
+    budget_tick_seconds: float = _env_float("FEATFORGE_BUDGET_TICK", 0.2)
+
 
 settings = Settings()

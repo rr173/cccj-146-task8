@@ -146,6 +146,65 @@ python -m pytest tests/test_arbiter.py tests/test_arbiter_worker.py \
 租约超时接替（三任 worker 进度台账齐全）、旧 epoch 心跳/进度/完成全拒绝、
 fail→retry 检查点继续、业务键重复入队（重放/409/租户隔离）。
 
+## 容量凭证与预算结算（模块 `featforge.budget`）
+
+每个客户一份预算策略：**按时间补充的计算额度**（`refill_amount` /
+`refill_interval`）、**余额突发上限** `burst_cap`、执行席位 `max_seats`。
+工单提交时必须声明预计消耗 `estimate`，系统在单个 `BEGIN IMMEDIATE` 事务内
+**原子预留**并开出容量凭证（`budget_vouchers`）；所有金额变动写只追加账本
+`budget_ledger`（补充/预留/追加预留/结算/退款/突发裁剪），余额永远等于账本
+`avail_delta` 重放值，任意一行之后都不允许为负——多提交者并发抢最后一份
+额度时由 SQLite 写锁串行化，恰好一份成功，其余进延后区。
+
+- **延后区与自动唤醒**：余额不足的工单状态 `deferred`，标出
+  `earliest_ready_at`（按补充锚点逐期模拟，估算与惰性补充共用同一套规则）；
+  `estimate > burst_cap` 的工单标 `over_burst_cap`，永不可行。补充采用惰性
+  计算（任何操作/后台 tick 先把 `last_refill_at` 按周期整倍推进，最多补一期，
+  更早各期受突发上限蒸发），到账后同一事务内按 FIFO pump 延后/暂停凭证，
+  够额即自动转 `reserved`，`wait_runnable` 被条件变量及时唤醒。
+- **单调进度结算**：`consumed_total` 是累计实际消耗，只能单调前进，相等/回退
+  上报幂等不扣费。未超预留直接结算；超预估时原子**追加预留**（余额不足则只
+  结算到已预留位置，凭证转 `paused`、`pending_total` 记下执行者想要的位置、
+  **立即释放执行席位**，补充到账后自动恢复 `reserved`，必须重新占用）。
+- **失联接替**：占用占席位并让 `claim_epoch` 单调 +1；心跳超时（或
+  `reap_expired`）后凭证保留在 `executing` 但清空持有者、释放席位，接替者
+  重新占用 epoch +1。旧持有者的迟到上报在接替前 409 lease_expired、接替后
+  409 stale_epoch（worker 不符 409 worker_mismatch），**已结算金额沿用、
+  绝不二次扣费**。
+- **终态唯一**：`completed` / `terminated` 互斥且只发生一次最终结算/退款。
+  终止只退**尚未使用**的预留（`reserved − settled`），退款让余额回补但受
+  `burst_cap` 裁剪（裁掉部分记 `lost_total` 与零金额 cap_clamp 留痕）；重复
+  终止幂等返回（`replayed=true, refunded=0`），完成与终止并发竞争时事务决出
+  一个胜者，输家拿到终态幂等结果或 409 terminal。
+- **在线调预算**：`PUT .../policy` 只改客户行：缩小突发上限会把当前余额向下
+  裁剪并留痕，调大上限/补充额会在同事务内尝试解锁延后工单；**绝不撤销或修改
+  已发出凭证的预留/结算**。
+
+```bash
+python scripts/budget_demo.py     # 7 个零依赖可复现场景（真实 SQLite + 手工时钟）
+python -m pytest tests/test_budget.py tests/test_budget_api.py -q
+```
+
+| 方法 & 路径 | 说明 |
+| --- | --- |
+| `POST /api/v1/budget/customers` | 配置客户预算（补充额/周期/突发上限/席位/期初余额；已存在幂等不覆盖） |
+| `GET  /api/v1/budget/customers` · `/customers/{name}` | 客户列表 / 视图（可用额、已预留未结算、已结算、下次补充、被阻塞工单） |
+| `PUT  /api/v1/budget/customers/{name}/policy` | 在线调预算（只影响后续预留，不撤销已发凭证） |
+| `POST /api/v1/budget/customers/{name}/vouchers` | 提交工单并原子预留（201 reserved / 202 deferred，同键重放/异参 409） |
+| `GET  /api/v1/budget/customers/{name}/vouchers` · `/api/v1/budget/vouchers/{id}` | 凭证列表（可按 state 过滤）/ 凭证详情 |
+| `POST .../vouchers/{id}/acquire` · `/heartbeat` | 占用凭证占席位（返回 epoch）/ 心跳续期（失联接替也走 acquire） |
+| `POST .../vouchers/{id}/consumed` | 按单调累计消耗结算（settled / paused+确认位置 / idempotent） |
+| `POST .../vouchers/{id}/complete` · `/terminate` | 完成最终结算退未用预留（终态唯一）/ 终止退款（幂等，只退未用部分） |
+| `POST /api/v1/budget/tick` | 立即执行一轮补充 + pump + 失联回收（后台线程也会周期执行） |
+| `GET  /api/v1/budget/ledger` · `/status` | 只追加账本查询（可按客户/凭证过滤）/ 状态页数据 |
+
+场景脚本验证：正常预留结算与退款、余额不足到点自动唤醒（t+59 仍延后、t+60
+取得资格）、12 份工单并发抢余额 10 恰好 1 份成功且账本无负余额行、实际消耗超
+预估追加成功→再超额暂停释放席位→补充后恢复、进程失联接替沿用已结算且旧 epoch
+上报 fence 拒绝、终止只退未用预留且重复终止幂等、完成与终止并发终态与退款只
+发生一次。状态页（`GET /`）展示每个客户的**可用额、已预留、已结算、下次补充
+时间及被预算阻塞的工单**。
+
 ## 架构
 
 ```
@@ -366,6 +425,8 @@ curl -s "localhost:8000/api/v1/features/gmv_1h/snapshots/u1/diff?asof_ts=600&a_g
 | `FEATFORGE_ARBITER_AGING_RATE` | `0.1` | 欠额+老化选择器的老化速率（等待秒数 × 该值加分） |
 | `FEATFORGE_ARBITER_HISTORY_LIMIT` | `500` | 仲裁历史保留条数 |
 | `FEATFORGE_ARBITER_SNAPSHOT_DIR` | `/tmp/featforge-snapshots` | 仲裁器快照作业默认产物目录 |
+| `FEATFORGE_BUDGET_LEASE_TTL` | `30` | 容量凭证执行租约 TTL 秒：无心跳的占用超时后可被接替（旧 epoch fence） |
+| `FEATFORGE_BUDGET_TICK` | `0.2` | 预算后台补充/唤醒线程轮询间隔秒（金额本身惰性计算，不依赖该线程） |
 
 ## 代码布局
 
@@ -373,8 +434,11 @@ curl -s "localhost:8000/api/v1/features/gmv_1h/snapshots/u1/diff?asof_ts=600&a_g
 featforge/
   config.py       配置与门槛
   transforms.py   变换版本注册表（sum/mean/max/... + 类别型）与偏差度量
-  db.py           SQLite schema（元数据/事件/订正台账/在线/离线/检查点/审计/仲裁器）
+  db.py           SQLite schema（元数据/事件/订正台账/在线/离线/检查点/审计/
+                  仲裁器/容量凭证与预算账本）
   store.py        领域核心：定义、写入、订正、回填、重算、校验、切换、回滚
+  budget.py       容量凭证与预算结算：时间补充/突发上限、原子预留、延后队列
+                  自动唤醒、单调结算与超额暂停、失联接替 fencing、终态退款
   arbiter.py      多租户仲裁器：统一 ready set、权重/席位/vruntime、欠额+老化、
                   claim_epoch fencing、心跳续期、游标进度、暂停恢复、仲裁历史
   arbiter_worker.py 无状态分片执行器（claim→逐分片进度→心跳→complete，故障注入）
@@ -400,9 +464,11 @@ scripts/demo.py   端到端演示
 scripts/arbiter_demo.py  多租户仲裁器 8 场景可复现演示（权重分流/防饥饿/席位/
                          暂停恢复/进程退出接替/旧 epoch 拒绝/检查点继续/业务键去重）
 scripts/snapshot_demo.py  快照搬运 8 场景可复现演示（两个真实进程）
-tests/            110+ 测试（PIT、检查点、迟到、代际门槛、回滚、并发、
+scripts/budget_demo.py  容量凭证与预算 7 场景可复现演示（预留结算/延后自动唤醒/
+                         并发抢额防透支/超额暂停/失联接替/终止幂等/完成-终止竞争）
+tests/            142 个测试（PIT、检查点、迟到、代际门槛、回滚、并发、
                   订正台账、崩溃恢复、读者一致性、时间旅行/跨代差异、HTTP、
-                  多租户仲裁器 35 个、快照搬运 21 个）
+                  多租户仲裁器 35 个、快照搬运 21 个、容量凭证与预算 25 个）
 ```
 
 > 说明：存储默认用 SQLite + WAL 以零依赖完整表达事务语义；`Store` 是数据库无关的
